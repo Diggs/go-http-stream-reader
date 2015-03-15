@@ -23,9 +23,9 @@ type httpStream struct {
 	Url                 string
 	Data                chan []byte
 	Exit                chan bool
-	tcpBackoff          *backoff.Linear
-	httpBackoff         *backoff.Exponential
-	httpThrottleBackoff *backoff.Exponential
+	tcpBackoff          *backoff.Backoff
+	httpBackoff         *backoff.Backoff
+	httpThrottleBackoff *backoff.Backoff
 }
 
 func (s *httpStream) Connect() error {
@@ -75,8 +75,8 @@ func (s *httpStream) enterReadStreamLoop() {
 			// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.)
 			if err != nil {
 				glog.Debugf("Encountered error establishing connection: %v", err)
+				glog.Debugf("Backing off %d milliseconds", s.tcpBackoff.GetBackoffDuration()/time.Millisecond)
 				s.tcpBackoff.Backoff()
-				glog.Debugf("Backed off %d milliseconds", s.tcpBackoff.LastWait/time.Millisecond)
 				continue
 			}
 
@@ -87,13 +87,13 @@ func (s *httpStream) enterReadStreamLoop() {
 				s.enterReadLineLoop(resp)
 			case 420:
 				glog.Debug("Encountered 420 backoff code")
+				glog.Debugf("Backing off %d minute(s)", s.httpThrottleBackoff.GetBackoffDuration()/time.Minute)
 				s.httpThrottleBackoff.Backoff()
-				glog.Debugf("Backed off %d minute(s)", s.httpThrottleBackoff.LastWait/time.Minute)
 			default:
 				// TODO: Fatal errors... 401 etc.
-				glog.Debugf("Encountered %d status code", resp.StatusCode)
+				glog.Debugf("Encountered %v status code", resp.StatusCode)
+				glog.Debugf("Backing off %d second(s)", s.httpBackoff.GetBackoffDuration()/time.Second)
 				s.httpBackoff.Backoff()
-				glog.Debugf("Backed off %d second(s)", s.httpBackoff.LastWait/time.Second)
 			}
 			resp.Body.Close()
 		}
@@ -106,25 +106,22 @@ func (s *httpStream) enterReadLineLoop(resp *http.Response) {
 
 	scanner := bufio.NewScanner(resp.Body)
 	for {
+		lineCh, errCh := s.readLine(resp, scanner)
 		select {
+		case data := <-lineCh:
+			glog.Debugf("Read line from stream: %d bytes.", len(data))
+			if len(data) > 0 { // drop empty heartbeat lines
+				s.Data <- data
+			}
 		case <-s.Exit:
 			glog.Debug("Exit signalled; leaving readLine loop.")
 			return
-		default:
-			lineCh, errCh := s.readLine(resp, scanner)
-			select {
-			case err := <-errCh:
-				glog.Debugf("Stream error; leaving readLine loop: %v", err)
-				return
-			case data := <-lineCh:
-				glog.Debugf("Read line from stream: %d bytes.", len(data))
-				if len(data) > 0 { // drop empty heartbeat lines
-					s.Data <- data
-				}
-			case <-time.After(time.Duration(STREAM_INACTIVITY_TIMEOUT_SECONDS) * time.Second):
-				glog.Debugf("Stream inactive for %d seconds; leaving readLine loop.", STREAM_INACTIVITY_TIMEOUT_SECONDS)
-				return
-			}
+		case err := <-errCh:
+			glog.Debugf("Stream error; leaving readLine loop: %v", err)
+			return
+		case <-time.After(time.Duration(STREAM_INACTIVITY_TIMEOUT_SECONDS) * time.Second):
+			glog.Debugf("Stream inactive for %d seconds; leaving readLine loop.", STREAM_INACTIVITY_TIMEOUT_SECONDS)
+			return
 		}
 	}
 }
