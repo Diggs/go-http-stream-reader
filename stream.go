@@ -20,11 +20,11 @@ const (
 )
 
 type httpStream struct {
-	Url               string
-	Data              chan []byte
-	Exit              chan bool
-	tcpBackoff       *backoff.Linear
-	httpBackoff       *backoff.Exponential
+	Url                 string
+	Data                chan []byte
+	Exit                chan bool
+	tcpBackoff          *backoff.Linear
+	httpBackoff         *backoff.Exponential
 	httpThrottleBackoff *backoff.Exponential
 }
 
@@ -72,13 +72,13 @@ func (s *httpStream) enterReadStreamLoop() {
 			return
 		default:
 			resp, err := s.connect()
-  		// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.)
-      if err != nil {
-        glog.Debugf("Encountered error establishing connection: %v", err)
-        s.tcpBackoff.Backoff()
-        glog.Debugf("Backed off %d milliseconds", s.tcpBackoff.LastWait / time.Millisecond)
-        continue
-      }
+			// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.)
+			if err != nil {
+				glog.Debugf("Encountered error establishing connection: %v", err)
+				s.tcpBackoff.Backoff()
+				glog.Debugf("Backed off %d milliseconds", s.tcpBackoff.LastWait/time.Millisecond)
+				continue
+			}
 
 			switch resp.StatusCode {
 			case 200, 304:
@@ -88,15 +88,15 @@ func (s *httpStream) enterReadStreamLoop() {
 			case 420:
 				glog.Debug("Encountered 420 backoff code")
 				s.httpThrottleBackoff.Backoff()
-				glog.Debugf("Backed off %d minute(s)", s.httpThrottleBackoff.LastWait / time.Minute)
+				glog.Debugf("Backed off %d minute(s)", s.httpThrottleBackoff.LastWait/time.Minute)
 			default:
 				// TODO: Fatal errors... 401 etc.
 				glog.Debugf("Encountered %d status code", resp.StatusCode)
 				s.httpBackoff.Backoff()
-				glog.Debugf("Backed off %d second(s)", s.httpBackoff.LastWait / time.Second)
+				glog.Debugf("Backed off %d second(s)", s.httpBackoff.LastWait/time.Second)
 			}
 			resp.Body.Close()
-		} 
+		}
 	}
 }
 
@@ -149,11 +149,11 @@ func NewStream(url string, autoConnect bool) *httpStream {
 	s.Data = make(chan []byte)
 	s.Exit = make(chan bool)
 	// Back off linearly, starting at 250ms, capping at 16 seconds
-	s.tcpBackoff = backoff.NewLinear(250 * time.Millisecond, 16 * time.Second)
+	s.tcpBackoff = backoff.NewLinear(250*time.Millisecond, 16*time.Second)
 	// Back off exponentially, starting at 5 seconds, capping at 320 seconds
-	s.httpBackoff = backoff.NewExponential(5 * time.Second, 320 * time.Second)
+	s.httpBackoff = backoff.NewExponential(5*time.Second, 320*time.Second)
 	// Back off exponentially, starting at 1 minute, with no cap
-	s.httpThrottleBackoff = backoff.NewExponential(time.Minute, 0) 
+	s.httpThrottleBackoff = backoff.NewExponential(time.Minute, 0)
 	if autoConnect {
 		s.Connect()
 	}
