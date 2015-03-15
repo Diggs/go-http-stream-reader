@@ -3,7 +3,7 @@ package stream
 import (
 	"bufio"
 	"github.com/diggs/glog"
-	"math"
+	"github.com/diggs/go-backoff"
 	"net/http"
 	"time"
 )
@@ -11,7 +11,6 @@ import (
 /**
 TODO:
 Fix up close
-Code clean up
 Args for headers and SSL
 Tests
 **/
@@ -24,18 +23,24 @@ type httpStream struct {
 	Url               string
 	Data              chan []byte
 	Exit              chan bool
-	tcpErrCount       int
-	httpErrCount      int
-	httpThrottleCount int
+	tcpBackoff       *backoff.Linear
+	httpBackoff       *backoff.Exponential
+	httpThrottleBackoff *backoff.Exponential
 }
 
 func (s *httpStream) Connect() error {
-	go s.enterStreamLoop()
+	go s.enterReadStreamLoop()
 	return nil
 }
 
 func (s *httpStream) Close() {
 	s.Exit <- true
+}
+
+func (s *httpStream) resetBackoffs() {
+	s.tcpBackoff.Reset()
+	s.httpBackoff.Reset()
+	s.httpThrottleBackoff.Reset()
 }
 
 func (s *httpStream) connect() (*http.Response, error) {
@@ -57,56 +62,38 @@ func (s *httpStream) connect() (*http.Response, error) {
 	return resp, nil
 }
 
-func (s *httpStream) enterStreamLoop() {
+func (s *httpStream) enterReadStreamLoop() {
 
-	glog.Debug("Entering stream loop...")
+	glog.Debug("Entering read stream loop...")
 	for {
 		select {
 		case <-s.Exit:
-			glog.Debug("Exit signalled; leaving stream loop.")
+			glog.Debug("Exit signalled; leaving read stream loop.")
 			return
 		default:
 			resp, err := s.connect()
-			// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.)
-			if err != nil {
-				glog.Debugf("Encountered error establishing connection: %v", err)
-				s.tcpErrCount++
-				// Backoff linearly, starting at 250ms, capping at 16 seconds
-				backoff := s.tcpErrCount * 250
-				if backoff > 16000 {
-					backoff = 16000
-				}
-				glog.Debugf("Backing off %d milliseconds", backoff)
-				time.Sleep(time.Duration(backoff) * time.Millisecond)
-				continue
-			}
+  		// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.)
+      if err != nil {
+        glog.Debugf("Encountered error establishing connection: %v", err)
+        s.tcpBackoff.Backoff()
+        glog.Debugf("Backed off %d milliseconds", s.tcpBackoff.LastWait / time.Millisecond)
+        continue
+      }
 
 			switch resp.StatusCode {
 			case 200, 304:
-				// Successful connection, start reading lines...
 				glog.Debug("Connection established...")
-				s.tcpErrCount = 0
-				s.httpErrCount = 0
-				s.httpThrottleCount = 0
+				s.resetBackoffs()
 				s.enterReadLineLoop(resp)
 			case 420:
-				// Back off exponentially, starting at 1 minute, with no cap
 				glog.Debug("Encountered 420 backoff code")
-				backoff := int(math.Pow(2, float64(s.httpThrottleCount)))
-				glog.Debugf("Backing off %d minute(s)", backoff)
-				s.httpThrottleCount++
-				time.Sleep(time.Duration(backoff) * time.Minute)
+				s.httpThrottleBackoff.Backoff()
+				glog.Debugf("Backed off %d minute(s)", s.httpThrottleBackoff.LastWait / time.Minute)
 			default:
 				// TODO: Fatal errors... 401 etc.
-				// Back off exponentially, starting at 5 seconds, capping at 320 seconds
 				glog.Debugf("Encountered %d status code", resp.StatusCode)
-				backoff := int(math.Pow(2, float64(s.httpErrCount)) * 5)
-				if backoff > 320 {
-					backoff = 320
-				}
-				s.httpErrCount++
-				glog.Debugf("Backing off %d second(s)", backoff)
-				time.Sleep(time.Duration(backoff) * time.Second)
+				s.httpBackoff.Backoff()
+				glog.Debugf("Backed off %d second(s)", s.httpBackoff.LastWait / time.Second)
 			}
 			resp.Body.Close()
 		} 
@@ -161,6 +148,12 @@ func NewStream(url string, autoConnect bool) *httpStream {
 	s.Url = url
 	s.Data = make(chan []byte)
 	s.Exit = make(chan bool)
+	// Back off linearly, starting at 250ms, capping at 16 seconds
+	s.tcpBackoff = backoff.NewLinear(250 * time.Millisecond, 16 * time.Second)
+	// Back off exponentially, starting at 5 seconds, capping at 320 seconds
+	s.httpBackoff = backoff.NewExponential(5 * time.Second, 320 * time.Second)
+	// Back off exponentially, starting at 1 minute, with no cap
+	s.httpThrottleBackoff = backoff.NewExponential(time.Minute, 0) 
 	if autoConnect {
 		s.Connect()
 	}
