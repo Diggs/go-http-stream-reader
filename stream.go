@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bufio"
+	"fmt"
 	"github.com/diggs/glog"
 	"github.com/diggs/go-backoff"
 	"net/http"
@@ -9,20 +10,29 @@ import (
 	"time"
 )
 
-/**
-TODO:
-Args for headers and SSL
-Tests
-**/
-
 const (
+	// STREAM_INACTIVITY_TIMEOUT_SECONDS specifies the amount of time to wait between receiving data
+	// before a stall condition is detected and the connection is backed off.
 	STREAM_INACTIVITY_TIMEOUT_SECONDS int = 90
 )
 
-type httpStream struct {
-	Url                 string
-	Headers             map[string]string
-	Data                chan []byte
+type HttpStream struct {
+	// HttpClient can be set to provide a custom HTTP client, useful if URL serves a self-signed SSL cert and validation errors need to be ignored, for example.
+	HttpClient *http.Client
+	// HttpRequest can be set to provide a custom HTTP request, useful in cases where the default HTTP GET verb is not appropriate, for example.
+	HttpRequest *http.Request
+	// URL specifies the endpoint to connect to - this will be ignored if a custom HttpRequest is set.
+	Url string
+	// Headers to send with the request when connecting to URL - this will be ignored if a custom HttpRequest is set.
+	Headers map[string]string
+	// Data provides the data channel that is handed each line or message that is read from the stream.
+	Data chan []byte
+	// Error can be read to be notified of any connection errors that occur during the lifetime of the stream.
+	// Fatal errors will be delivered on this channel before the stream is closed permanently via Close().
+	// Reading from this channel is optional, it will not block if there is no reader.
+	Error chan error
+	// Exit can be read to be notified when the stream has exited permanently e.g. due to Close() being called, or a fatal error occurring.
+	// Reading from this channel is optional, it will not block if there is no reader.
 	Exit                chan bool
 	exiting             bool
 	waitGroup           *sync.WaitGroup
@@ -31,12 +41,13 @@ type httpStream struct {
 	httpThrottleBackoff *backoff.Backoff
 }
 
-func (s *httpStream) Connect() error {
+// Connect to the configured URL and begin reading data.
+func (s *HttpStream) Connect() {
 	go s.enterReadStreamLoop()
-	return nil
 }
 
-func (s *httpStream) Close() {
+// Close permanently disconnects the stream reader and cleans up all resources.
+func (s *HttpStream) Close() {
 	if s.exiting {
 		return
 	}
@@ -45,30 +56,42 @@ func (s *httpStream) Close() {
 	go func() {
 		s.waitGroup.Wait()
 		close(s.Data)
+		close(s.Error)
 	}()
 }
 
-func (s *httpStream) resetBackoffs() {
+func (s *HttpStream) resetBackoffs() {
 	s.tcpBackoff.Reset()
 	s.httpBackoff.Reset()
 	s.httpThrottleBackoff.Reset()
 }
 
-func (s *httpStream) connect() (*http.Response, error) {
+func (s *HttpStream) sendErr(err error) {
+	// write to error chan without blocking if there are no readers
+	select {
+	case s.Error <- err:
+	default:
+	}
+}
+
+func (s *HttpStream) connect() (*http.Response, error) {
 
 	glog.Debugf("Establishing connection to %s...", s.Url)
 
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", s.Url, nil)
-	if err != nil {
-		return nil, err
+	req := s.HttpRequest
+	if req == nil {
+		var err error
+		req, err = http.NewRequest("GET", s.Url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		for key, val := range s.Headers {
+			req.Header.Set(key, val)
+		}
 	}
 
-	for key, val := range s.Headers {
-		req.Header.Set(key, val)
-	}
-
-	resp, err := client.Do(req)
+	resp, err := s.HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +99,7 @@ func (s *httpStream) connect() (*http.Response, error) {
 	return resp, nil
 }
 
-func (s *httpStream) enterReadStreamLoop() {
+func (s *HttpStream) enterReadStreamLoop() {
 	s.waitGroup.Add(1)
 	defer s.waitGroup.Done()
 
@@ -89,15 +112,16 @@ func (s *httpStream) enterReadStreamLoop() {
 		default:
 			resp, err := s.connect()
 			defer resp.Body.Close()
-			// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.)
+			// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.) and close the stream if appropriate.
 			if err != nil {
+				s.sendErr(err)
 				glog.Debugf("Encountered error establishing connection: %v", err)
 				glog.Debugf("Backing off %d milliseconds", s.tcpBackoff.NextDuration/time.Millisecond)
 				s.tcpBackoff.Backoff()
 				continue
 			}
 			switch resp.StatusCode {
-			case 200, 304:
+			case 200:
 				glog.Debug("Connection established...")
 				s.resetBackoffs()
 				s.enterReadLineLoop(resp)
@@ -105,9 +129,16 @@ func (s *httpStream) enterReadStreamLoop() {
 				glog.Debug("Encountered 420 backoff code")
 				glog.Debugf("Backing off %d minute(s)", s.httpThrottleBackoff.NextDuration/time.Minute)
 				s.httpThrottleBackoff.Backoff()
+			case 401:
+				err = fmt.Errorf("Encountered fatal status code: %v", resp.StatusCode)
+				glog.Debug(err.Error())
+				glog.Debug("Fatal error; Closing stream.")
+				s.sendErr(err)
+				s.Close()
 			default:
-				// TODO: Fatal errors... 401 etc.
-				glog.Debugf("Encountered %v status code", resp.StatusCode)
+				err = fmt.Errorf("Encountered resumable status code: %v", resp.StatusCode)
+				s.sendErr(err)
+				glog.Debug(err.Error())
 				glog.Debugf("Backing off %d second(s)", s.httpBackoff.NextDuration/time.Second)
 				s.httpBackoff.Backoff()
 			}
@@ -115,7 +146,7 @@ func (s *httpStream) enterReadStreamLoop() {
 	}
 }
 
-func (s *httpStream) enterReadLineLoop(resp *http.Response) {
+func (s *HttpStream) enterReadLineLoop(resp *http.Response) {
 
 	glog.Debug("Entering read line loop...")
 
@@ -133,6 +164,7 @@ func (s *httpStream) enterReadLineLoop(resp *http.Response) {
 			return
 		case err := <-errCh:
 			glog.Debugf("Stream error; leaving readLine loop: %v", err)
+			s.sendErr(err)
 			return
 		case <-time.After(time.Duration(STREAM_INACTIVITY_TIMEOUT_SECONDS) * time.Second):
 			glog.Debugf("Stream inactive for %d seconds; leaving readLine loop.", STREAM_INACTIVITY_TIMEOUT_SECONDS)
@@ -141,7 +173,7 @@ func (s *httpStream) enterReadLineLoop(resp *http.Response) {
 	}
 }
 
-func (s *httpStream) readLine(resp *http.Response, scanner *bufio.Scanner) (chan []byte, chan error) {
+func (s *HttpStream) readLine(resp *http.Response, scanner *bufio.Scanner) (chan []byte, chan error) {
 	glog.Debug("Scanning for line...")
 	lineCh := make(chan []byte)
 	errCh := make(chan error)
@@ -155,12 +187,16 @@ func (s *httpStream) readLine(resp *http.Response, scanner *bufio.Scanner) (chan
 	return lineCh, errCh
 }
 
-func NewStream(url string, headers map[string]string, autoConnect bool) *httpStream {
-	s := httpStream{}
+// NewStream creates a new stream instance.
+// Override any desired properties of the httpStream object before calling Connect() to begin reading data.
+func NewStream(url string) *HttpStream {
+	s := HttpStream{}
+	s.HttpClient = &http.Client{}
+	s.HttpRequest = nil
 	s.Url = url
 	s.Data = make(chan []byte)
+	s.Error = make(chan error)
 	s.Exit = make(chan bool)
-	s.Headers = headers
 	s.waitGroup = &sync.WaitGroup{}
 	// Back off linearly, starting at 250ms, capping at 16 seconds
 	s.tcpBackoff = backoff.NewLinear(250*time.Millisecond, 16*time.Second)
@@ -168,8 +204,5 @@ func NewStream(url string, headers map[string]string, autoConnect bool) *httpStr
 	s.httpBackoff = backoff.NewExponential(5*time.Second, 320*time.Second)
 	// Back off exponentially, starting at 1 minute, with no cap
 	s.httpThrottleBackoff = backoff.NewExponential(time.Minute, 0)
-	if autoConnect {
-		s.Connect()
-	}
 	return &s
 }
