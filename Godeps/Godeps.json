@@ -5,6 +5,10 @@
 		{
 			"ImportPath": "github.com/diggs/glog",
 			"Rev": "5921588b9f17e8ca6788cd8883e28b2512ae5f37"
+		},
+		{
+			"ImportPath": "github.com/diggs/go-backoff",
+			"Rev": "399621610c15d34ed50b145e56e6391a420b9939"
 		}
 	]
 }
