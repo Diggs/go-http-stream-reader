@@ -8,10 +8,10 @@ Streams are read using the [bufio Scanner](http://golang.org/pkg/bufio/#Scanner)
 
 ## Usage
 
-Open a stream by using the ```NewStream``` function, passing in the remote URL to connect to. Then read line data from the stream using the ```Data``` channel:
+Open a stream by using the ```NewStream``` function, passing in the remote URL to connect to, as well as any headers that should be set when connecting. Then read line data from the stream using the ```Data``` channel:
 
 ```go
-s := stream.NewStream("https://userstream.twitter.com/1.1/user.json", true)
+s := stream.NewStream("https://userstream.twitter.com/1.1/user.json", map[string]string{"Authorization":"foobar"}, true)
 for {
   select {
   case line := <-s.Data:

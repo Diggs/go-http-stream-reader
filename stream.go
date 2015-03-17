@@ -21,6 +21,7 @@ const (
 
 type httpStream struct {
 	Url                 string
+	Headers             map[string]string
 	Data                chan []byte
 	Exit                chan bool
 	exiting             bool
@@ -61,6 +62,10 @@ func (s *httpStream) connect() (*http.Response, error) {
 	req, err := http.NewRequest("GET", s.Url, nil)
 	if err != nil {
 		return nil, err
+	}
+
+	for key, val := range s.Headers {
+		req.Header.Set(key, val)
 	}
 
 	resp, err := client.Do(req)
@@ -150,11 +155,12 @@ func (s *httpStream) readLine(resp *http.Response, scanner *bufio.Scanner) (chan
 	return lineCh, errCh
 }
 
-func NewStream(url string, autoConnect bool) *httpStream {
+func NewStream(url string, headers map[string]string, autoConnect bool) *httpStream {
 	s := httpStream{}
 	s.Url = url
 	s.Data = make(chan []byte)
 	s.Exit = make(chan bool)
+	s.Headers = headers
 	s.waitGroup = &sync.WaitGroup{}
 	// Back off linearly, starting at 250ms, capping at 16 seconds
 	s.tcpBackoff = backoff.NewLinear(250*time.Millisecond, 16*time.Second)
