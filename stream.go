@@ -5,12 +5,12 @@ import (
 	"github.com/diggs/glog"
 	"github.com/diggs/go-backoff"
 	"net/http"
+	"sync"
 	"time"
 )
 
 /**
 TODO:
-Fix up close
 Args for headers and SSL
 Tests
 **/
@@ -23,6 +23,8 @@ type httpStream struct {
 	Url                 string
 	Data                chan []byte
 	Exit                chan bool
+	exiting             bool
+	waitGroup           *sync.WaitGroup
 	tcpBackoff          *backoff.Backoff
 	httpBackoff         *backoff.Backoff
 	httpThrottleBackoff *backoff.Backoff
@@ -34,7 +36,15 @@ func (s *httpStream) Connect() error {
 }
 
 func (s *httpStream) Close() {
-	s.Exit <- true
+	if s.exiting {
+		return
+	}
+	s.exiting = true
+	close(s.Exit)
+	go func() {
+		s.waitGroup.Wait()
+		close(s.Data)
+	}()
 }
 
 func (s *httpStream) resetBackoffs() {
@@ -48,7 +58,6 @@ func (s *httpStream) connect() (*http.Response, error) {
 	glog.Debugf("Establishing connection to %s...", s.Url)
 
 	client := &http.Client{}
-
 	req, err := http.NewRequest("GET", s.Url, nil)
 	if err != nil {
 		return nil, err
@@ -63,6 +72,8 @@ func (s *httpStream) connect() (*http.Response, error) {
 }
 
 func (s *httpStream) enterReadStreamLoop() {
+	s.waitGroup.Add(1)
+	defer s.waitGroup.Done()
 
 	glog.Debug("Entering read stream loop...")
 	for {
@@ -72,14 +83,14 @@ func (s *httpStream) enterReadStreamLoop() {
 			return
 		default:
 			resp, err := s.connect()
+			defer resp.Body.Close()
 			// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.)
 			if err != nil {
 				glog.Debugf("Encountered error establishing connection: %v", err)
-				glog.Debugf("Backing off %d milliseconds", s.tcpBackoff.GetBackoffDuration()/time.Millisecond)
+				glog.Debugf("Backing off %d milliseconds", s.tcpBackoff.NextDuration/time.Millisecond)
 				s.tcpBackoff.Backoff()
 				continue
 			}
-
 			switch resp.StatusCode {
 			case 200, 304:
 				glog.Debug("Connection established...")
@@ -87,15 +98,14 @@ func (s *httpStream) enterReadStreamLoop() {
 				s.enterReadLineLoop(resp)
 			case 420:
 				glog.Debug("Encountered 420 backoff code")
-				glog.Debugf("Backing off %d minute(s)", s.httpThrottleBackoff.GetBackoffDuration()/time.Minute)
+				glog.Debugf("Backing off %d minute(s)", s.httpThrottleBackoff.NextDuration/time.Minute)
 				s.httpThrottleBackoff.Backoff()
 			default:
 				// TODO: Fatal errors... 401 etc.
 				glog.Debugf("Encountered %v status code", resp.StatusCode)
-				glog.Debugf("Backing off %d second(s)", s.httpBackoff.GetBackoffDuration()/time.Second)
+				glog.Debugf("Backing off %d second(s)", s.httpBackoff.NextDuration/time.Second)
 				s.httpBackoff.Backoff()
 			}
-			resp.Body.Close()
 		}
 	}
 }
@@ -145,6 +155,7 @@ func NewStream(url string, autoConnect bool) *httpStream {
 	s.Url = url
 	s.Data = make(chan []byte)
 	s.Exit = make(chan bool)
+	s.waitGroup = &sync.WaitGroup{}
 	// Back off linearly, starting at 250ms, capping at 16 seconds
 	s.tcpBackoff = backoff.NewLinear(250*time.Millisecond, 16*time.Second)
 	// Back off exponentially, starting at 5 seconds, capping at 320 seconds
