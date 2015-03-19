@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/diggs/glog"
 	"github.com/diggs/go-backoff"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ type HttpStream struct {
 	Url string
 	// Headers to send with the request when connecting to URL - this will be ignored if a custom HttpRequest is set.
 	Headers map[string]string
-	// Data provides the data channel that is handed each line or message that is read from the stream.
+	// Data provides the data channel that is handed each data chunk that is read from the stream.
 	Data chan []byte
 	// Error can be read to be notified of any connection errors that occur during the lifetime of the stream.
 	// Fatal errors will be delivered on this channel before the stream is closed permanently via Close().
@@ -99,6 +100,41 @@ func (s *HttpStream) connect() (*http.Response, error) {
 	return resp, nil
 }
 
+func (s *HttpStream) connectAndReadStream() {
+	resp, err := s.connect()
+	defer resp.Body.Close()
+	// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.) and close the stream if appropriate.
+	if err != nil {
+		s.sendErr(err)
+		glog.Debugf("Encountered error establishing connection: %v", err)
+		glog.Debugf("Backing off %d milliseconds", s.tcpBackoff.NextDuration/time.Millisecond)
+		s.tcpBackoff.Backoff()
+		return
+	}
+	switch resp.StatusCode {
+	case 200:
+		glog.Debug("Connection established...")
+		s.resetBackoffs()
+		s.enterReadDataLoop(resp.Body)
+	case 420:
+		glog.Debug("Encountered 420 backoff code")
+		glog.Debugf("Backing off %d minute(s)", s.httpThrottleBackoff.NextDuration/time.Minute)
+		s.httpThrottleBackoff.Backoff()
+	case 401:
+		err = fmt.Errorf("Encountered fatal status code: %v", resp.StatusCode)
+		glog.Debug(err.Error())
+		glog.Debug("Fatal error; Closing stream.")
+		s.sendErr(err)
+		s.Close()
+	default:
+		err = fmt.Errorf("Encountered resumable status code: %v", resp.StatusCode)
+		s.sendErr(err)
+		glog.Debug(err.Error())
+		glog.Debugf("Backing off %d second(s)", s.httpBackoff.NextDuration/time.Second)
+		s.httpBackoff.Backoff()
+	}
+}
+
 func (s *HttpStream) enterReadStreamLoop() {
 	s.waitGroup.Add(1)
 	defer s.waitGroup.Done()
@@ -110,81 +146,50 @@ func (s *HttpStream) enterReadStreamLoop() {
 			glog.Debug("Exit signalled; leaving read stream loop.")
 			return
 		default:
-			resp, err := s.connect()
-			defer resp.Body.Close()
-			// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.) and close the stream if appropriate.
-			if err != nil {
-				s.sendErr(err)
-				glog.Debugf("Encountered error establishing connection: %v", err)
-				glog.Debugf("Backing off %d milliseconds", s.tcpBackoff.NextDuration/time.Millisecond)
-				s.tcpBackoff.Backoff()
-				continue
-			}
-			switch resp.StatusCode {
-			case 200:
-				glog.Debug("Connection established...")
-				s.resetBackoffs()
-				s.enterReadLineLoop(resp)
-			case 420:
-				glog.Debug("Encountered 420 backoff code")
-				glog.Debugf("Backing off %d minute(s)", s.httpThrottleBackoff.NextDuration/time.Minute)
-				s.httpThrottleBackoff.Backoff()
-			case 401:
-				err = fmt.Errorf("Encountered fatal status code: %v", resp.StatusCode)
-				glog.Debug(err.Error())
-				glog.Debug("Fatal error; Closing stream.")
-				s.sendErr(err)
-				s.Close()
-			default:
-				err = fmt.Errorf("Encountered resumable status code: %v", resp.StatusCode)
-				s.sendErr(err)
-				glog.Debug(err.Error())
-				glog.Debugf("Backing off %d second(s)", s.httpBackoff.NextDuration/time.Second)
-				s.httpBackoff.Backoff()
-			}
+			s.connectAndReadStream()
 		}
 	}
 }
 
-func (s *HttpStream) enterReadLineLoop(resp *http.Response) {
+func (s *HttpStream) enterReadDataLoop(reader io.Reader) {
 
-	glog.Debug("Entering read line loop...")
+	glog.Debug("Entering read data loop...")
 
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(reader)
 	for {
-		lineCh, errCh := s.readLine(resp, scanner)
+		dataCh, errCh := s.readData(scanner)
 		select {
-		case data := <-lineCh:
-			glog.Debugf("Read line from stream: %d bytes.", len(data))
-			if len(data) > 0 { // drop empty heartbeat lines
+		case data := <-dataCh:
+			glog.Debugf("Read data chunk from stream: %d bytes.", len(data))
+			if len(data) > 0 { // drop empty heartbeats
 				s.Data <- data
 			}
 		case <-s.Exit:
-			glog.Debug("Exit signalled; leaving readLine loop.")
+			glog.Debug("Exit signalled; leaving read data loop.")
 			return
 		case err := <-errCh:
-			glog.Debugf("Stream error; leaving readLine loop: %v", err)
+			glog.Debugf("Stream error; leaving read data loop: %v", err)
 			s.sendErr(err)
 			return
 		case <-time.After(time.Duration(STREAM_INACTIVITY_TIMEOUT_SECONDS) * time.Second):
-			glog.Debugf("Stream inactive for %d seconds; leaving readLine loop.", STREAM_INACTIVITY_TIMEOUT_SECONDS)
+			glog.Debugf("Stream inactive for %d seconds; leaving read data loop.", STREAM_INACTIVITY_TIMEOUT_SECONDS)
 			return
 		}
 	}
 }
 
-func (s *HttpStream) readLine(resp *http.Response, scanner *bufio.Scanner) (chan []byte, chan error) {
-	glog.Debug("Scanning for line...")
-	lineCh := make(chan []byte)
+func (s *HttpStream) readData(scanner *bufio.Scanner) (<-chan []byte, <-chan error) {
+	glog.Debug("Scanning for data...")
+	dataCh := make(chan []byte)
 	errCh := make(chan error)
 	go func() {
 		if ok := scanner.Scan(); !ok {
 			errCh <- scanner.Err()
 			return
 		}
-		lineCh <- scanner.Bytes()[:]
+		dataCh <- scanner.Bytes()[:]
 	}()
-	return lineCh, errCh
+	return dataCh, errCh
 }
 
 // NewStream creates a new stream instance.
