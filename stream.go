@@ -102,15 +102,16 @@ func (s *HttpStream) connect() (*http.Response, error) {
 
 func (s *HttpStream) connectAndReadStream() {
 	resp, err := s.connect()
-	defer resp.Body.Close()
-	// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.) and close the stream if appropriate.
 	if err != nil {
+		// TODO Differentiate between transient tcp/ip errors and fatal errors (such as malformed url etc.) 
+		// and close the stream if appropriate.
 		s.sendErr(err)
 		glog.Debugf("Encountered error establishing connection: %v", err)
 		glog.Debugf("Backing off %d milliseconds", s.tcpBackoff.NextDuration/time.Millisecond)
 		s.tcpBackoff.Backoff()
 		return
 	}
+	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case 200:
 		glog.Debug("Connection established...")
